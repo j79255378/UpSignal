@@ -11,11 +11,18 @@
 (define-constant ERR_CIRCULAR_DELEGATION (err u109))
 (define-constant ERR_INVALID_DELEGATION_AMOUNT (err u110))
 (define-constant ERR_DELEGATION_LIMIT_EXCEEDED (err u111))
+(define-constant ERR_STAKE_LOCKED (err u112))
+(define-constant ERR_INVALID_LOCK_PERIOD (err u113))
+(define-constant ERR_EARLY_WITHDRAWAL_PENALTY (err u114))
+(define-constant ERR_NO_LOCKED_STAKE (err u115))
+(define-constant ERR_INVALID_REWARD_RATE (err u116))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var min-proposal-stake uint u1000000)
 (define-data-var voting-period uint u1008)
 (define-data-var max-delegation-depth uint u5)
+(define-data-var base-reward-rate uint u100)
+(define-data-var early-withdrawal-penalty-rate uint u2000)
 
 (define-map proposals
   { proposal-id: uint }
@@ -68,6 +75,25 @@
     total-delegated: uint,
     delegation-count: uint
   }
+)
+
+(define-map time-locked-stakes
+  { user: principal }
+  {
+    locked-amount: uint,
+    lock-start-height: uint,
+    lock-end-height: uint,
+    lock-period-blocks: uint,
+    reward-multiplier: uint,
+    accumulated-rewards: uint,
+    last-reward-claim-height: uint,
+    active: bool
+  }
+)
+
+(define-map lock-period-multipliers
+  { lock-period-blocks: uint }
+  { multiplier: uint }
 )
 
 (define-public (stake-tokens (amount uint))
@@ -433,6 +459,232 @@
   )
 )
 
+(define-public (create-time-locked-stake (amount uint) (lock-period-blocks uint))
+  (let (
+    (current-stake (default-to u0 (get stake (map-get? user-stakes { user: tx-sender }))))
+    (existing-lock (map-get? time-locked-stakes { user: tx-sender }))
+    (current-height stacks-block-height)
+    (lock-end-height (+ current-height lock-period-blocks))
+    (multiplier (default-to u10000 (get multiplier (map-get? lock-period-multipliers { lock-period-blocks: lock-period-blocks }))))
+  )
+    (asserts! (> amount u0) ERR_INVALID_DELEGATION_AMOUNT)
+    (asserts! (>= current-stake amount) ERR_INSUFFICIENT_STAKE)
+    (asserts! (> lock-period-blocks u0) ERR_INVALID_LOCK_PERIOD)
+    (asserts! (is-none existing-lock) ERR_STAKE_LOCKED)
+    
+    (map-set user-stakes
+      { user: tx-sender }
+      { stake: (- current-stake amount) }
+    )
+    
+    (map-set time-locked-stakes
+      { user: tx-sender }
+      {
+        locked-amount: amount,
+        lock-start-height: current-height,
+        lock-end-height: lock-end-height,
+        lock-period-blocks: lock-period-blocks,
+        reward-multiplier: multiplier,
+        accumulated-rewards: u0,
+        last-reward-claim-height: current-height,
+        active: true
+      }
+    )
+    
+    (ok {
+      locked-amount: amount,
+      lock-end-height: lock-end-height,
+      multiplier: multiplier
+    })
+  )
+)
+
+(define-public (unlock-time-locked-stake)
+  (let (
+    (locked-stake (unwrap! (map-get? time-locked-stakes { user: tx-sender }) ERR_NO_LOCKED_STAKE))
+    (current-height stacks-block-height)
+    (lock-end-height (get lock-end-height locked-stake))
+    (locked-amount (get locked-amount locked-stake))
+    (current-stake (default-to u0 (get stake (map-get? user-stakes { user: tx-sender }))))
+    (is-expired (>= current-height lock-end-height))
+  )
+    (asserts! (get active locked-stake) ERR_NO_LOCKED_STAKE)
+    
+    (if is-expired
+      (begin
+        (map-set user-stakes
+          { user: tx-sender }
+          { stake: (+ current-stake locked-amount) }
+        )
+        (map-set time-locked-stakes
+          { user: tx-sender }
+          (merge locked-stake { active: false })
+        )
+        (ok locked-amount)
+      )
+      (let (
+        (penalty-rate (var-get early-withdrawal-penalty-rate))
+        (penalty-amount (/ (* locked-amount penalty-rate) u10000))
+        (return-amount (- locked-amount penalty-amount))
+      )
+        (map-set user-stakes
+          { user: tx-sender }
+          { stake: (+ current-stake return-amount) }
+        )
+        (map-set time-locked-stakes
+          { user: tx-sender }
+          (merge locked-stake { active: false })
+        )
+        (ok return-amount)
+      )
+    )
+  )
+)
+
+(define-public (claim-time-lock-rewards)
+  (let (
+    (locked-stake (unwrap! (map-get? time-locked-stakes { user: tx-sender }) ERR_NO_LOCKED_STAKE))
+    (current-height stacks-block-height)
+    (last-claim-height (get last-reward-claim-height locked-stake))
+    (locked-amount (get locked-amount locked-stake))
+    (multiplier (get reward-multiplier locked-stake))
+    (base-rate (var-get base-reward-rate))
+    (blocks-since-claim (- current-height last-claim-height))
+    (reward-amount (/ (* (* locked-amount base-rate) (* multiplier blocks-since-claim)) (* u10000 u10000)))
+    (current-stake (default-to u0 (get stake (map-get? user-stakes { user: tx-sender }))))
+  )
+    (asserts! (get active locked-stake) ERR_NO_LOCKED_STAKE)
+    (asserts! (> blocks-since-claim u0) ERR_INVALID_REWARD_RATE)
+    
+    (map-set user-stakes
+      { user: tx-sender }
+      { stake: (+ current-stake reward-amount) }
+    )
+    
+    (map-set time-locked-stakes
+      { user: tx-sender }
+      (merge locked-stake {
+        accumulated-rewards: (+ (get accumulated-rewards locked-stake) reward-amount),
+        last-reward-claim-height: current-height
+      })
+    )
+    
+    (ok reward-amount)
+  )
+)
+
+(define-public (set-lock-period-multiplier (lock-period-blocks uint) (multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> multiplier u10000) ERR_INVALID_REWARD_RATE)
+    (map-set lock-period-multipliers
+      { lock-period-blocks: lock-period-blocks }
+      { multiplier: multiplier }
+    )
+    (ok multiplier)
+  )
+)
+
+(define-public (update-base-reward-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set base-reward-rate new-rate)
+    (ok new-rate)
+  )
+)
+
+(define-public (update-early-withdrawal-penalty-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-rate u5000) ERR_INVALID_REWARD_RATE)
+    (var-set early-withdrawal-penalty-rate new-rate)
+    (ok new-rate)
+  )
+)
+
+(define-read-only (get-time-locked-stake (user principal))
+  (map-get? time-locked-stakes { user: user })
+)
+
+(define-read-only (get-lock-period-multiplier (lock-period-blocks uint))
+  (map-get? lock-period-multipliers { lock-period-blocks: lock-period-blocks })
+)
+
+(define-read-only (calculate-pending-rewards (user principal))
+  (match (map-get? time-locked-stakes { user: user })
+    locked-stake
+    (if (get active locked-stake)
+      (let (
+        (current-height stacks-block-height)
+        (last-claim-height (get last-reward-claim-height locked-stake))
+        (locked-amount (get locked-amount locked-stake))
+        (multiplier (get reward-multiplier locked-stake))
+        (base-rate (var-get base-reward-rate))
+        (blocks-since-claim (- current-height last-claim-height))
+        (reward-amount (/ (* (* locked-amount base-rate) (* multiplier blocks-since-claim)) (* u10000 u10000)))
+      )
+        (ok {
+          pending-rewards: reward-amount,
+          blocks-since-claim: blocks-since-claim,
+          effective-rate: (/ (* base-rate multiplier) u10000)
+        })
+      )
+      (ok { pending-rewards: u0, blocks-since-claim: u0, effective-rate: u0 })
+    )
+    (ok { pending-rewards: u0, blocks-since-claim: u0, effective-rate: u0 })
+  )
+)
+
+(define-read-only (get-enhanced-voting-power (user principal))
+  (let (
+    (regular-stake (default-to u0 (get stake (map-get? user-stakes { user: user }))))
+    (locked-stake-info (map-get? time-locked-stakes { user: user }))
+    (validator-weight (default-to u1 (get weight (map-get? validator-weights { validator: user }))))
+  )
+    (match locked-stake-info
+      locked-data
+      (if (get active locked-data)
+        (let (
+          (locked-amount (get locked-amount locked-data))
+          (multiplier (get reward-multiplier locked-data))
+          (enhanced-locked-power (/ (* locked-amount multiplier) u10000))
+          (total-power (+ regular-stake enhanced-locked-power))
+        )
+          (ok {
+            regular-stake: regular-stake,
+            locked-stake: locked-amount,
+            enhanced-locked-power: enhanced-locked-power,
+            total-voting-power: (* total-power validator-weight),
+            lock-multiplier: multiplier
+          })
+        )
+        (ok {
+          regular-stake: regular-stake,
+          locked-stake: u0,
+          enhanced-locked-power: u0,
+          total-voting-power: (* regular-stake validator-weight),
+          lock-multiplier: u10000
+        })
+      )
+      (ok {
+        regular-stake: regular-stake,
+        locked-stake: u0,
+        enhanced-locked-power: u0,
+        total-voting-power: (* regular-stake validator-weight),
+        lock-multiplier: u10000
+      })
+    )
+  )
+)
+
+(define-read-only (get-base-reward-rate)
+  (var-get base-reward-rate)
+)
+
+(define-read-only (get-early-withdrawal-penalty-rate)
+  (var-get early-withdrawal-penalty-rate)
+)
+
 (define-read-only (calculate-consensus (proposal-id uint))
   (let (
     (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) (err "proposal not found")))
@@ -474,3 +726,6 @@
 ;;     (list)
 ;;   )
 ;; )
+
+
+
